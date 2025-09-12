@@ -11,7 +11,6 @@ An intuitive annotation tool for detection and instance segmentation, powered by
 
 ## Installation
 
-### Setup
 It's recommended to install the dependencies in a `.venv` or `conda` virtual environment.
 ```bash
 pip install ultralytics
@@ -24,7 +23,10 @@ pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126
 ```
 
 ## Usage
-
+1. Select input and output directory
+2. Select annotation type and saving format
+3. Happy annotating
+4. use keybord `left/right` to navigate, `space` to save. Use mouse `wheel` to zoom, `right click` to pan.
 
 ## Acknowledgements
 
