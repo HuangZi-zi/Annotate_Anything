@@ -10,6 +10,7 @@ import shutil
 from ultralytics.models.sam import SAM
 from datetime import datetime
 import torch
+from scipy.spatial import distance
 
 class ImageAnnotationTool:
     """
@@ -44,6 +45,8 @@ class ImageAnnotationTool:
         self.current_photo = None
         self.mask = None
         self.bboxes = []
+        self.polygon_points = []
+        self.polygon_mask = None
         self.zoom_level = 1.0
         self.offset_x, self.offset_y = 0, 0
         self.panning = False
@@ -51,14 +54,15 @@ class ImageAnnotationTool:
 
         # --- Annotation Tool Variables ---
         self.annotation_mode = "mask"  # 'mask' or 'bbox'
-        self.mask_tool_mode = "brush"  # 'brush' or 'magic_click'
+        self.mask_tool_mode = "brush"  # 'brush' or 'magic_click' or 'polygon'
         self.tool_polarity = "positive" # 'positive' or 'negative'
         self.brush_size = 10
         self.drawing = False
         self.drawn_segments = []
         self.bbox_start_coords = None
         self.current_bbox_rect = None
-
+        self.REMOVAL_DISTANCE_THRESHOLD = 15
+        
         # --- Export Format Variables ---
         self.export_png_var = tk.BooleanVar(value=True)
         self.export_yolo_var = tk.BooleanVar(value=True)
@@ -146,6 +150,7 @@ class ImageAnnotationTool:
         
         ttk.Label(tools_frame, text="Tool:").pack(side=tk.LEFT, padx=(0, 5))
         ttk.Radiobutton(tools_frame, text="Brush", variable=self.tool_var, value="brush", command=self._change_tool).pack(side=tk.LEFT)
+        ttk.Radiobutton(tools_frame, text="Polygon", variable=self.tool_var, value="polygon", command=self._change_tool).pack(side=tk.LEFT)
         ttk.Radiobutton(tools_frame, text="Magic Click", variable=self.tool_var, value="magic_click", command=self._change_tool).pack(side=tk.LEFT)
 
         ttk.Label(tools_frame, text="Polarity:").pack(side=tk.LEFT, padx=(20, 5))
@@ -232,6 +237,7 @@ class ImageAnnotationTool:
         elif event.keysym == "Right": self.next_image()
         elif event.keysym == "space": self._save_and_next()
         elif event.keysym == "n": self._save_instance_and_add_new()
+        elif event.keysym == "p": self._merge_polygon_into_mask()
     
     def _on_model_selected(self, event):
         """Handles SAM model selection from the dropdown."""
@@ -243,6 +249,8 @@ class ImageAnnotationTool:
         if self.annotation_mode == 'mask':
             if self.mask_tool_mode == "magic_click":
                 self._magic_click(event)
+            elif self.mask_tool_mode == "polygon":
+                self._polygon_click(event)
             else:
                 self._start_mask_drawing(event)
         elif self.annotation_mode == 'bbox':
@@ -332,7 +340,9 @@ class ImageAnnotationTool:
         
         # Reset annotations for the new image
         self.mask = np.zeros(self.current_image.shape[:2], dtype=np.uint8)
+        self.polygon_mask = np.zeros(self.current_image.shape[:2], dtype=np.uint8)
         self.bboxes = []
+        self.polygon_points = []
         self.instance_count = 0
 
         # Clear the YOLO annotation file if it exists, to start fresh for this image
@@ -423,6 +433,9 @@ class ImageAnnotationTool:
 
     def _save_current_mask_instance(self):
         """Core logic to save the current mask and append its annotations."""
+        if self.polygon_mask is not None and np.sum(self.polygon_mask)>0:
+            self._merge_polygon_into_mask()
+            
         if np.sum(self.mask) == 0:
             return False # Nothing to save
         if not self.output_dir:
@@ -603,6 +616,83 @@ class ImageAnnotationTool:
         
         self._update_status()
 
+    def _polygon_click(self, event):
+
+        # Convert canvas click coordinates to image coordinates
+        canvas_x = self.canvas.canvasx(event.x)
+        canvas_y = self.canvas.canvasy(event.y)
+        img_x, img_y = self._canvas_to_image_coords(canvas_x, canvas_y)
+
+        # Ensure the click is within the image bounds
+        h, w = self.current_image.shape[:2]
+        if not (0 <= img_x < w and 0 <= img_y < h):
+            return
+
+        clicked_point = (img_x, img_y)
+
+        if len(self.polygon_points)>0:
+            distances = [distance.euclidean(clicked_point, p) for p in self.polygon_points]
+            min_dist_idx = np.argmin(distances)
+        else:
+            distances=[]
+        # If the closest point is within the threshold, remove it
+        if distances and distances[min_dist_idx] < self.REMOVAL_DISTANCE_THRESHOLD:
+            self.polygon_points.pop(min_dist_idx)
+        else:
+            self.polygon_points.append(list(clicked_point))
+
+        # After modifying the points, update the mask and redraw the display
+        self._update_mask_with_polygon()
+        self.update_display()
+        self._update_mask_status()
+        self._update_status()
+
+    def _update_mask_with_polygon(self):
+        """
+        Generates a new mask from the current list of polygon points.
+        This function ensures that the polygon is drawn fresh on each update,
+        preventing artifacts from repeated bitwise operations.
+        """
+        # Always start from the mask state before the current polygon was drawn.
+        # This makes the polygon drawing a single, editable operation.
+        if self.polygon_mask is not None:
+            temp_mask = self.polygon_mask.copy()
+        else:
+            temp_mask = np.zeros_like(self.polygon_mask)
+
+        # A polygon requires at least 3 vertices to form a shape.
+        if len(self.polygon_points) >= 3:
+            # Create a blank mask to draw the polygon onto.
+            poly_mask_layer = np.zeros_like(temp_mask)
+
+            # Format points for OpenCV's fillPoly function.
+            pts = np.array(self.polygon_points, dtype=np.int32)
+
+            centroid = np.mean(pts, axis=0)
+            angles = np.arctan2(pts[:, 1] - centroid[1], pts[:, 0] - centroid[0])
+            pts = pts[np.argsort(angles)]
+            cv2.fillPoly(poly_mask_layer, [pts], 255)
+
+            # Combine the new polygon with the original mask.
+            # This assumes the polygon is always additive. For subtractive
+            # polygons, you would need another UI toggle and use bitwise_and/not.
+            # self.polygon_mask = cv2.bitwise_or(temp_mask, poly_mask_layer)
+            self.polygon_mask = poly_mask_layer
+        else:
+            # If there are not enough points for a shape, just show the original mask.
+            self.polygon_mask = temp_mask
+
+    def _merge_polygon_into_mask(self):
+        if self.polygon_mask is not None and np.sum(self.polygon_mask)>0:
+            if self.tool_polarity == "positive":
+                self.mask = cv2.bitwise_or(self.mask, self.polygon_mask)
+            else:
+                self.mask = cv2.bitwise_and(self.mask, cv2.bitwise_not(self.polygon_mask))
+
+            self.polygon_mask = np.zeros(self.current_image.shape[:2], dtype=np.uint8)
+            self.polygon_points = []
+            self.update_display()
+
     # --- Mask Drawing ---
     def _start_mask_drawing(self, event):
         self.drawing = True
@@ -706,6 +796,26 @@ class ImageAnnotationTool:
             display_image_data = blended
         else:
             display_image_data = self.current_image
+
+        if self.annotation_mode == 'mask' and self.polygon_mask is not None and np.sum(self.polygon_mask) > 0:
+            colored_mask = np.zeros_like(self.current_image)
+            colored_mask[self.polygon_mask > 0] = [0, 255, 255]
+            blended = cv2.addWeighted(display_image_data, 0.7, colored_mask, 0.3, 0)
+            display_image_data = blended
+
+        if len(self.polygon_points)!=0:
+            colored_mask = np.zeros_like(self.current_image)
+            for point in self.polygon_points:
+                cv2.drawMarker(
+                    img=colored_mask,
+                    position=point,
+                    color=(255, 255, 0),
+                    markerType=cv2.MARKER_DIAMOND,
+                    markerSize=2,
+                    thickness=1
+                )
+            blended = cv2.addWeighted(display_image_data, 0.7, colored_mask, 0.3, 0)
+            display_image_data = blended
 
         resized_image = cv2.resize(display_image_data, (display_w, display_h), interpolation=cv2.INTER_NEAREST)
         pil_image = Image.fromarray(resized_image)
