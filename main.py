@@ -199,7 +199,7 @@ class ImageAnnotationTool:
         export_frame.pack(fill=tk.X)
         
         ttk.Label(export_frame, text="Export as:").pack(side=tk.LEFT, padx=(0, 5))
-        ttk.Checkbutton(export_frame, text="Individual PNG Masks", variable=self.export_png_var).pack(side=tk.LEFT)
+        ttk.Checkbutton(export_frame, text="(Semantic)PNG Masks", variable=self.export_png_var).pack(side=tk.LEFT)
         ttk.Checkbutton(export_frame, text="YOLO TXT", variable=self.export_yolo_var).pack(side=tk.LEFT)
         ttk.Checkbutton(export_frame, text="COCO JSON", variable=self.export_coco_var).pack(side=tk.LEFT)
 
@@ -382,12 +382,10 @@ class ImageAnnotationTool:
         output_masks_dir = self.output_dir / "masks"
         for i, ann in enumerate(self.annotations):
             instance_mask = np.zeros((h, w), dtype=np.uint8)
-            cv2.fillPoly(instance_mask, [np.array(p, dtype=np.int32) for p in ann['polygons']], 255)
-            class_id = ann['class_id']
-            class_name = self.class_names.get(class_id, f"class_{class_id}")
-            safe_class_name = re.sub(r'[\\/*?:"<>|]', "", class_name).replace(' ', '_')
-            mask_path = output_masks_dir / f"{base_name}_instance_{i}_class_{class_id}_{safe_class_name}.png"
-            cv2.imwrite(str(mask_path), instance_mask)
+            class_id = ann['class_id']+1
+            cv2.fillPoly(instance_mask, [np.array(p, dtype=np.int32) for p in ann['polygons']], class_id*10)
+        mask_path = output_masks_dir / f"{base_name}.png"
+        cv2.imwrite(str(mask_path), instance_mask)
 
     def _save_yolo_annotation(self, base_name, h, w):
         yolo_path = self.output_dir / "annotations" / f"{base_name}.txt"
