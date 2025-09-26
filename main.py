@@ -6,30 +6,35 @@ import numpy as np
 from PIL import Image, ImageTk
 import json
 from pathlib import Path
-import shutil
+import re
 from ultralytics.models.sam import SAM
+from ultralytics import YOLO
 from datetime import datetime
 import torch
 from scipy.spatial import distance
 
 class ImageAnnotationTool:
     """
-    A GUI tool for creating instance segmentation annotations.
+    A GUI tool for creating and editing polygon-based instance segmentation annotations.
 
     Features:
-    - Mask and Bounding Box annotation modes.
-    - SAM2 integration ('Magic Click') for semi-automated segmentation.
-    - Support for multiple instances per image, saved as separate mask files.
+    - Click-to-Edit: Directly click on any saved polygon to load it for modification.
+    - Annotations are stored as polygons with user-defined class names.
+    - Interactive tools: Brush, Polygon, and 'Magic Click' (SAM integration).
+    - Support for multiple instances and classes per image.
     - Zooming and panning for precise annotations.
-    - Export annotations to PNG masks, YOLO segmentation format, and/or COCO JSON format.
+    - Export formats: PNG masks, YOLO TXT, and COCO JSON.
     """
     # --- Constants ---
     SAM_MODELS = ['sam2_b.pt', 'sam2_t.pt', 'mobile_sam.pt']
     SUPPORTED_EXTENSIONS = ['.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.tif']
+    CLASS_COLORS = [(255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 0),
+                    (0, 255, 255), (255, 0, 255), (255, 128, 0), (128, 0, 255)]
+
 
     def __init__(self, root):
         self.root = root
-        self.root.title("Image Annotation Tool for Instance Segmentation")
+        self.root.title("Polygon-Based Image Annotation Tool")
         self.root.geometry("1200x800")
 
         # --- State Variables ---
@@ -38,13 +43,14 @@ class ImageAnnotationTool:
         self.mask_dir = ""
         self.image_files = []
         self.current_index = 0
-        self.instance_count = 0
+        self.annotations = []
+        self.class_names = {}
+        self.editing_instance_index = None # Holds the index of the instance being edited
 
         # --- Image & Canvas Variables ---
         self.current_image = None
         self.current_photo = None
-        self.mask = None
-        self.bboxes = []
+        self.mask = None # Temporary mask for active drawing/editing
         self.polygon_points = []
         self.polygon_mask = None
         self.zoom_level = 1.0
@@ -53,32 +59,32 @@ class ImageAnnotationTool:
         self.pan_start_x, self.pan_start_y = 0, 0
 
         # --- Annotation Tool Variables ---
-        self.annotation_mode = "mask"  # 'mask' or 'bbox'
-        self.mask_tool_mode = "brush"  # 'brush' or 'magic_click' or 'polygon'
-        self.tool_polarity = "positive" # 'positive' or 'negative'
+        self.mask_tool_mode = "brush"
+        self.tool_polarity = "positive"
         self.brush_size = 10
         self.drawing = False
         self.drawn_segments = []
-        self.bbox_start_coords = None
-        self.current_bbox_rect = None
-        self.REMOVAL_DISTANCE_THRESHOLD = 15
+        self.REMOVAL_DISTANCE_THRESHOLD = 5
+        self.current_class = tk.IntVar(value=0)
         
         # --- Export Format Variables ---
-        self.export_png_var = tk.BooleanVar(value=True)
+        self.export_png_var = tk.BooleanVar(value=False)
         self.export_yolo_var = tk.BooleanVar(value=True)
-        self.export_coco_var = tk.BooleanVar(value=False)
+        self.export_coco_var = tk.BooleanVar(value=True)
 
         # --- UI Variables ---
         self.status_var = tk.StringVar(value="Select directories to start.")
         self.mask_status_var = tk.StringVar(value="No active mask.")
-        self.annotation_mode_var = tk.StringVar(value=self.annotation_mode)
         self.tool_var = tk.StringVar(value=self.mask_tool_mode)
         self.tool_polarity_var = tk.StringVar(value=self.tool_polarity)
         self.brush_var = tk.IntVar(value=self.brush_size)
         self.model_var = tk.StringVar(value=self.SAM_MODELS[0])
+        self.class_name_var = tk.StringVar()
 
         # --- AI Model ---
         self.sam_model = None
+        self.yolo_model = None
+        self.yolo_model_dir = None
 
         # --- COCO Dataset Variables ---
         self.coco_data = None
@@ -87,7 +93,7 @@ class ImageAnnotationTool:
 
         self._setup_ui()
         self._bind_events()
-        self._load_sam_model(self.model_var.get())
+        # self._load_sam_model(self.model_var.get())
 
     # -------------------------------------------------------------------------
     # UI Setup
@@ -98,53 +104,77 @@ class ImageAnnotationTool:
         main_frame = ttk.Frame(self.root, padding="10")
         main_frame.pack(fill=tk.BOTH, expand=True)
 
-        # --- Top Control Panels ---
         self._setup_control_panels(main_frame)
-
-        # --- Canvas for Image Display ---
         self._setup_canvas(main_frame)
         
-        # --- Instructions Label ---
-        instructions = ttk.Label(main_frame, text="Controls: ←/→: Navigate | Space: Save & Next | 'n': Save Instance | Mouse Wheel: Zoom | Right-Click+Drag: Pan")
+        instructions = ttk.Label(main_frame, text="Controls: ←/→: Navigate | Space: Save & Next | 'i': Save Instance | 'p': Finalize Polygon | Mouse Wheel: Zoom | Right-Click+Drag: Pan")
         instructions.pack(pady=(10, 0))
 
     def _setup_control_panels(self, parent):
         """Sets up the top control panels for directories, modes, and tools."""
-        # Panel 1: Directories, Mode, SAM Model, Zoom
         control_frame1 = ttk.Frame(parent)
         control_frame1.pack(fill=tk.X, pady=(0, 10))
 
         ttk.Button(control_frame1, text="Input Dir", command=self._select_input_dir).pack(side=tk.LEFT, padx=(0, 5))
         ttk.Button(control_frame1, text="Output Dir", command=self._select_output_dir).pack(side=tk.LEFT, padx=(0, 5))
         ttk.Button(control_frame1, text="Load Mask Dir", command=self._select_mask_dir).pack(side=tk.LEFT, padx=(0, 5))
-
-        ttk.Label(control_frame1, text="Mode:").pack(side=tk.LEFT, padx=(20, 5))
-        ttk.Radiobutton(control_frame1, text="Mask", variable=self.annotation_mode_var, value="mask", command=self._change_annotation_mode).pack(side=tk.LEFT)
-        ttk.Radiobutton(control_frame1, text="Bbox", variable=self.annotation_mode_var, value="bbox", command=self._change_annotation_mode).pack(side=tk.LEFT)
+        ttk.Button(control_frame1, text="Load Model Dir", command=self._select_model_dir).pack(side=tk.LEFT, padx=(0, 5))
 
         ttk.Label(control_frame1, text="Zoom:").pack(side=tk.LEFT, padx=(20, 5))
         ttk.Button(control_frame1, text="+", command=self._zoom_in, width=3).pack(side=tk.LEFT)
         ttk.Button(control_frame1, text="-", command=self._zoom_out, width=3).pack(side=tk.LEFT, padx=(2, 0))
         ttk.Button(control_frame1, text="Fit", command=self.fit_to_window, width=4).pack(side=tk.LEFT, padx=(2, 0))
 
-        # Panel 2: Tool-specific controls (Mask/Bbox)
+        ttk.Label(control_frame1, text="Current Class:").pack(side=tk.LEFT, padx=(20, 5))
+        self.class_label = ttk.Label(control_frame1, textvariable=self.current_class, width=3, anchor="center")
+        self.class_label.pack(side=tk.LEFT)
+        ttk.Button(control_frame1, text="+", command=self._next_class, width=3).pack(side=tk.LEFT)
+        ttk.Button(control_frame1, text="-", command=self._previous_class, width=3).pack(side=tk.LEFT)
+        
+        self.class_name_entry = ttk.Entry(control_frame1, textvariable=self.class_name_var, width=15)
+        self.class_name_entry.pack(side=tk.LEFT, padx=(5, 0))
+        self.class_name_entry.bind("<FocusOut>", self._save_current_class_name)
+        self.class_name_entry.bind("<Return>", self._save_current_class_name)
+
         self.tool_control_frame = ttk.Frame(parent)
         self.tool_control_frame.pack(fill=tk.X, pady=(0, 10))
         self._setup_mask_controls(self.tool_control_frame)
-        self._setup_bbox_controls(self.tool_control_frame)
-        self.mask_controls_frame.pack(fill=tk.X) # Show mask controls by default
+        self.mask_controls_frame.pack(fill=tk.X)
 
-        # Panel 3: Status Labels
         status_frame = ttk.Frame(parent)
         status_frame.pack(fill=tk.X, pady=(0, 10))
         ttk.Label(status_frame, textvariable=self.mask_status_var).pack(side=tk.LEFT)
         ttk.Label(status_frame, textvariable=self.status_var).pack(side=tk.RIGHT)
 
+    def _next_class(self):
+        self._save_current_class_name()
+        self.current_class.set(self.current_class.get() + 1)
+        self._update_class_display()
+
+    def _previous_class(self):
+        if self.current_class.get() > 0:
+            self._save_current_class_name()
+            self.current_class.set(self.current_class.get() - 1)
+            self._update_class_display()
+    
+    def _save_current_class_name(self, event=None):
+        class_id = self.current_class.get()
+        class_name = self.class_name_var.get().strip()
+        if class_name: self.class_names[class_id] = class_name
+        if event: self.root.focus_set()
+
+    def _update_class_display(self):
+        class_id = self.current_class.get()
+        name = self.class_names.get(class_id, f"class_{class_id}")
+        self.class_name_var.set(name)
+        color = self.CLASS_COLORS[class_id % len(self.CLASS_COLORS)]
+        hex_color = f'#{color[0]:02x}{color[1]:02x}{color[2]:02x}'
+        self.class_label.configure(background=hex_color)
+
+
     def _setup_mask_controls(self, parent):
-        """Sets up the widgets specific to the 'Mask' annotation mode."""
         self.mask_controls_frame = ttk.Frame(parent)
         
-        # First row: Tools and settings
         tools_frame = ttk.Frame(self.mask_controls_frame)
         tools_frame.pack(fill=tk.X, pady=(0, 5))
         
@@ -165,47 +195,34 @@ class ImageAnnotationTool:
         model_selector.pack(side=tk.LEFT, padx=(0, 5))
         model_selector.bind("<<ComboboxSelected>>", self._on_model_selected)
 
-        # Second row: Export format checkboxes and action buttons
         export_frame = ttk.Frame(self.mask_controls_frame)
         export_frame.pack(fill=tk.X)
         
-        # Export format checkboxes
         ttk.Label(export_frame, text="Export as:").pack(side=tk.LEFT, padx=(0, 5))
-        ttk.Checkbutton(export_frame, text="PNG Mask", variable=self.export_png_var, command=self._validate_export_selection).pack(side=tk.LEFT)
-        ttk.Checkbutton(export_frame, text="YOLO TXT", variable=self.export_yolo_var, command=self._validate_export_selection).pack(side=tk.LEFT)
-        ttk.Checkbutton(export_frame, text="COCO JSON", variable=self.export_coco_var, command=self._validate_export_selection).pack(side=tk.LEFT)
+        ttk.Checkbutton(export_frame, text="(Semantic)PNG Masks", variable=self.export_png_var).pack(side=tk.LEFT)
+        ttk.Checkbutton(export_frame, text="YOLO TXT", variable=self.export_yolo_var).pack(side=tk.LEFT)
+        ttk.Checkbutton(export_frame, text="COCO JSON", variable=self.export_coco_var).pack(side=tk.LEFT)
 
-        # Action buttons
-        ttk.Button(export_frame, text="Clear Mask", command=self.clear_mask).pack(side=tk.RIGHT, padx=(5, 0))
-        ttk.Button(export_frame, text="Save Instance & New", command=self._save_instance_and_add_new).pack(side=tk.RIGHT, padx=(5, 0))
+        ttk.Button(export_frame, text="Clear Active Mask", command=self.clear_mask).pack(side=tk.RIGHT, padx=(5, 0))
+        ttk.Button(export_frame, text="Clear All Annotations", command=self.clear_all_annotations).pack(side=tk.RIGHT, padx=(5, 0))
+        ttk.Button(export_frame, text="Save Instance ('i')", command=self._save_instance).pack(side=tk.RIGHT, padx=(5, 0))
         ttk.Button(export_frame, text="Load Existing Mask", command=self._load_mask_from_file).pack(side=tk.RIGHT)
 
-    def _setup_bbox_controls(self, parent):
-        """Sets up the widgets specific to the 'Bbox' annotation mode."""
-        self.bbox_controls_frame = ttk.Frame(parent)
-        ttk.Button(self.bbox_controls_frame, text="Clear All Bboxes", command=self.clear_bboxes).pack(side=tk.LEFT)
-
     def _setup_canvas(self, parent):
-        """Sets up the canvas with scrollbars for displaying the image."""
         canvas_frame = ttk.Frame(parent)
         canvas_frame.pack(fill=tk.BOTH, expand=True)
-        canvas_frame.grid_rowconfigure(0, weight=1)
-        canvas_frame.grid_columnconfigure(0, weight=1)
-
+        canvas_frame.grid_rowconfigure(0, weight=1); canvas_frame.grid_columnconfigure(0, weight=1)
         self.canvas = tk.Canvas(canvas_frame, bg="gray")
         h_scroll = ttk.Scrollbar(canvas_frame, orient=tk.HORIZONTAL, command=self.canvas.xview)
         v_scroll = ttk.Scrollbar(canvas_frame, orient=tk.VERTICAL, command=self.canvas.yview)
         self.canvas.configure(xscrollcommand=h_scroll.set, yscrollcommand=v_scroll.set)
-
         self.canvas.grid(row=0, column=0, sticky="nsew")
         h_scroll.grid(row=1, column=0, sticky="ew")
         v_scroll.grid(row=0, column=1, sticky="ns")
 
     def _bind_events(self):
-        """Binds all keyboard and mouse events."""
         self.root.bind("<KeyPress>", self._on_key_press)
         self.root.focus_set()
-
         self.canvas.bind("<Button-1>", self._on_canvas_press)
         self.canvas.bind("<B1-Motion>", self._on_canvas_drag)
         self.canvas.bind("<ButtonRelease-1>", self._on_canvas_release)
@@ -213,78 +230,41 @@ class ImageAnnotationTool:
         self.canvas.bind("<B3-Motion>", self._pan)
         self.canvas.bind("<ButtonRelease-3>", self._stop_panning)
         self.canvas.bind("<MouseWheel>", self._zoom)
-        self.canvas.bind("<Button-4>", self._zoom)  # Linux scroll up
-        self.canvas.bind("<Button-5>", self._zoom)  # Linux scroll down
+        self.canvas.bind("<Button-4>", self._zoom); self.canvas.bind("<Button-5>", self._zoom)
 
     # -------------------------------------------------------------------------
-    # Export Format Validation
-    # -------------------------------------------------------------------------
-
-    def _validate_export_selection(self):
-        """Ensures at least one export format is selected."""
-        if not (self.export_png_var.get() or self.export_yolo_var.get() or self.export_coco_var.get()):
-            # If user unchecked all, automatically check PNG
-            self.export_png_var.set(True)
-            messagebox.showwarning("Export Format", "At least one export format must be selected. PNG format has been automatically selected.")
-
-    # -------------------------------------------------------------------------
-    # Event Handlers
+    # Event Handlers & UI Callbacks
     # -------------------------------------------------------------------------
 
     def _on_key_press(self, event):
-        """Handles global key press events."""
+        if isinstance(self.root.focus_get(), ttk.Entry): return
         if event.keysym == "Left": self.previous_image()
         elif event.keysym == "Right": self.next_image()
         elif event.keysym == "space": self._save_and_next()
-        elif event.keysym == "n": self._save_instance_and_add_new()
+        elif event.keysym == "i": self._save_instance()
         elif event.keysym == "p": self._merge_polygon_into_mask()
     
-    def _on_model_selected(self, event):
-        """Handles SAM model selection from the dropdown."""
-        selected_model = self.model_var.get()
-        self._load_sam_model(selected_model)
+    def _on_model_selected(self, event): self._load_sam_model(self.model_var.get())
 
     def _on_canvas_press(self, event):
-        """Handles the start of an action on the canvas (drawing or magic click)."""
-        if self.annotation_mode == 'mask':
-            if self.mask_tool_mode == "magic_click":
-                self._magic_click(event)
-            elif self.mask_tool_mode == "polygon":
-                self._polygon_click(event)
-            else:
-                self._start_mask_drawing(event)
-        elif self.annotation_mode == 'bbox':
-            self._start_bbox_drawing(event)
+        # First, check if the user is clicking an existing instance to edit it
+        if self._select_instance_for_editing(event):
+            return # If an instance was selected, don't start a new drawing
+
+        # If not editing, proceed with the normal drawing tools
+        if self.mask_tool_mode == "magic_click": self._magic_click(event)
+        elif self.mask_tool_mode == "polygon": self._polygon_click(event)
+        else: self._start_mask_drawing(event)
 
     def _on_canvas_drag(self, event):
-        """Handles mouse drag events for drawing."""
-        if self.annotation_mode == 'mask': self._draw_mask(event)
-        elif self.annotation_mode == 'bbox': self._draw_bbox(event)
+        if self.mask_tool_mode == "brush": self._draw_mask(event)
 
     def _on_canvas_release(self, event):
-        """Handles the end of a drawing action."""
-        if self.annotation_mode == 'mask': self._stop_mask_drawing(event)
-        elif self.annotation_mode == 'bbox': self._stop_bbox_drawing(event)
+        if self.mask_tool_mode == "brush": self._stop_mask_drawing(event)
 
-    def _change_annotation_mode(self):
-        """Switches the UI and behavior between 'Mask' and 'Bbox' modes."""
-        self.annotation_mode = self.annotation_mode_var.get()
-        self.mask_controls_frame.pack_forget()
-        self.bbox_controls_frame.pack_forget()
-        if self.annotation_mode == 'mask':
-            self.mask_controls_frame.pack(fill=tk.X)
-        elif self.annotation_mode == 'bbox':
-            self.bbox_controls_frame.pack(fill=tk.X)
-        self.update_display()
-
-    def _change_tool(self):
-        self.mask_tool_mode = self.tool_var.get()
-    
-    def _change_tool_polarity(self):
-        self.tool_polarity = self.tool_polarity_var.get()
-
-    def _change_brush_size(self, value):
-        self.brush_size = int(float(value))
+    def _change_tool(self): self.mask_tool_mode = self.tool_var.get()
+    def _change_tool_polarity(self): self.tool_polarity = self.tool_polarity_var.get()
+    def _change_brush_size(self, value): self.brush_size = int(float(value))
 
     # -------------------------------------------------------------------------
     # Directory and File Handling
@@ -292,290 +272,212 @@ class ImageAnnotationTool:
     
     def _select_input_dir(self):
         directory = filedialog.askdirectory(title="Select Input Directory")
-        if directory:
-            self.input_dir = Path(directory)
-            self._load_image_list()
+        if directory: self.input_dir = Path(directory); self._load_image_list()
 
     def _select_output_dir(self):
         directory = filedialog.askdirectory(title="Select Output Directory")
         if directory:
             self.output_dir = Path(directory)
-            (self.output_dir / "images").mkdir(exist_ok=True)
-            (self.output_dir / "masks").mkdir(exist_ok=True)
-            (self.output_dir / "annotations").mkdir(exist_ok=True)
+            (self.output_dir / "images").mkdir(exist_ok=True, parents=True)
+            (self.output_dir / "masks").mkdir(exist_ok=True, parents=True)
+            (self.output_dir / "annotations").mkdir(exist_ok=True, parents=True)
             self._initialize_coco_dataset()
 
     def _select_mask_dir(self):
         directory = filedialog.askdirectory(title="Select Existing Mask Directory")
+        if directory: self.mask_dir = Path(directory)
+
+    def _select_model_dir(self):
+        directory = filedialog.askopenfilename(title="Select YOLO Model File")
         if directory:
-            self.mask_dir = Path(directory)
-            if self.image_files:
-                self.load_current_image()
+            self.yolo_model_dir = Path(directory)
+            self.yolo_model = YOLO(self.yolo_model_dir)
+            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+            self.yolo_model.to(device)
 
     def _load_image_list(self):
-        """Scans the input directory for supported image files."""
         if not self.input_dir: return
-        self.image_files = sorted([
-            p for p in self.input_dir.rglob('*')
-            if p.is_file() and p.suffix.lower() in self.SUPPORTED_EXTENSIONS
-        ])
-        self.current_index = 0
-        if self.image_files:
-            self.load_current_image()
-        else:
-            messagebox.showinfo("No Images", "No supported images found in the selected directory.")
-            self.status_var.set("No images found.")
+        self.image_files = sorted([p for p in self.input_dir.rglob('*') if p.is_file() and p.suffix.lower() in self.SUPPORTED_EXTENSIONS])
+        if self.image_files: self.current_index = 0; self.load_current_image()
+        else: messagebox.showinfo("No Images", "No supported images found in the selected directory.")
 
     def load_current_image(self):
-        """Loads the image at the current index and prepares it for annotation."""
         if not self.image_files: return
-        
         image_path = self.image_files[self.current_index]
         try:
             self.current_image = cv2.imread(str(image_path))
             self.current_image = cv2.cvtColor(self.current_image, cv2.COLOR_BGR2RGB)
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to load image: {image_path}\n{e}")
-            return
+        except Exception as e: messagebox.showerror("Error", f"Failed to load image: {image_path}\n{e}"); return
         
-        # Reset annotations for the new image
+        # Reset annotations and state for the new image
+        self.current_class.set(0); self.class_names = {}; self._update_class_display()
         self.mask = np.zeros(self.current_image.shape[:2], dtype=np.uint8)
         self.polygon_mask = np.zeros(self.current_image.shape[:2], dtype=np.uint8)
-        self.bboxes = []
-        self.polygon_points = []
-        self.instance_count = 0
+        self.annotations = []; self.polygon_points = []; self.editing_instance_index = None
 
-        # Clear the YOLO annotation file if it exists, to start fresh for this image
         if self.output_dir:
             base_name = image_path.stem
-            if self.export_yolo_var.get():
-                yolo_path = self.output_dir / "annotations" / f"{base_name}.txt"
-                if yolo_path.exists():
-                    yolo_path.unlink() # Delete the file
-            # Copy original image to output directory once
+            yolo_path = self.output_dir / "annotations" / f"{base_name}.txt"
+            if yolo_path.exists(): yolo_path.unlink()
             output_image_path = self.output_dir / "images" / f"{base_name}.png"
             cv2.imwrite(str(output_image_path), cv2.cvtColor(self.current_image, cv2.COLOR_RGB2BGR))
 
         if self.mask_dir: self._try_load_existing_mask()
-        
+        if self.yolo_model: self._try_run_yolo_model()
         self.fit_to_window()
-        self._update_status()
-        self._update_mask_status()
-
-    # -------------------------------------------------------------------------
-    # COCO Dataset Initialization
-    # -------------------------------------------------------------------------
-
-    def _initialize_coco_dataset(self):
-        """Initializes the COCO dataset structure."""
-        self.coco_data = {
-            "info": {
-                "description": "Instance segmentation annotations",
-                "version": "1.0",
-                "year": datetime.now().year,
-                "contributor": "Image Annotation Tool",
-                "date_created": datetime.now().isoformat()
-            },
-            "licenses": [
-                {
-                    "id": 1,
-                    "name": "Unknown License",
-                    "url": ""
-                }
-            ],
-            "images": [],
-            "annotations": [],
-            "categories": [
-                {
-                    "id": 1,
-                    "name": "object",
-                    "supercategory": "thing"
-                }
-            ]
-        }
-        self.image_id_counter = 1
-        self.annotation_id_counter = 1
 
     # -------------------------------------------------------------------------
     # Annotation Saving & Navigation
     # -------------------------------------------------------------------------
 
-    def _save_instance_and_add_new(self):
-        """Saves the current mask as an instance and clears the canvas for a new one."""
-        if self.annotation_mode != 'mask':
-            messagebox.showwarning("Warning", "This feature is only available in Mask mode.")
+    def _save_instance(self):
+        """Saves the current active mask (new or edited) as a permanent polygon annotation."""
+        self._save_current_class_name()
+        self._merge_polygon_into_mask()
+
+        if np.sum(self.mask) == 0:
+            # messagebox.showinfo("Info", "No active mask to save as an instance.")
+            self.clear_mask()
             return
 
-        if self._save_current_mask_instance():
-            self.instance_count += 1
-            self.clear_mask()
-            self.status_var.set(f"Saved instance {self.instance_count - 1}. Ready for next.")
+        contours, _ = cv2.findContours(self.mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours: self.clear_mask(); return
+
+        simplified_polygons = []
+        for contour in contours:
+            if cv2.contourArea(contour) < 10: continue
+            epsilon = 0.005 * cv2.arcLength(contour, True)
+            simplified_contour = cv2.approxPolyDP(contour, epsilon, True)
+            if len(simplified_contour) >= 3:
+                simplified_polygons.append(simplified_contour.squeeze(axis=1).tolist())
+
+        if not simplified_polygons: self.clear_mask(); return
+
+        new_annotation = {"class_id": self.current_class.get(), "polygons": simplified_polygons}
+        
+        # If we were editing, the original instance was already removed.
+        # This new one is simply added to the list.
+        self.annotations.append(new_annotation)
+        
+        edit_str = f" (edited instance {self.editing_instance_index})" if self.editing_instance_index is not None else ""
+        self.status_var.set(f"Saved instance {len(self.annotations)}{edit_str}.")
+        self.editing_instance_index = None # Reset editing state
+        self.clear_mask()
 
     def _save_and_next(self):
-        """Saves the final annotation for the current image and moves to the next."""
-        if not self.output_dir or self.current_image is None:
-            messagebox.showerror("Error", "Please select an output directory and load an image.")
-            return
+        if not self.output_dir or self.current_image is None: messagebox.showerror("Error", "Select output dir and load image."); return
+        if np.sum(self.mask) > 0: self._save_instance()
+        if not self.annotations: self.next_image(); return
+            
+        base_name = self.image_files[self.current_index].stem
+        h, w = self.current_image.shape[:2]
 
-        if self.annotation_mode == 'mask':
-            # Save even if the mask is empty, to signal completion and move on
-            self._save_current_mask_instance()
-            # Save COCO annotations for the current image if enabled
-            if self.export_coco_var.get():
-                self._save_coco_annotations()
-        elif self.annotation_mode == 'bbox':
-            if not self.bboxes:
-                messagebox.showwarning("Warning", "No bounding boxes drawn. Nothing to save.")
-                return
-            self._save_bbox_annotation()
+        if self.export_png_var.get(): self._save_png_masks(base_name, h, w)
+        if self.export_yolo_var.get(): self._save_yolo_annotation(base_name, h, w)
+        if self.export_coco_var.get(): self._add_image_to_coco(base_name, h, w)
         
         self.next_image()
 
-    def _save_current_mask_instance(self):
-        """Core logic to save the current mask and append its annotations."""
-        if self.polygon_mask is not None and np.sum(self.polygon_mask)>0:
-            self._merge_polygon_into_mask()
-            
-        if np.sum(self.mask) == 0:
-            return False # Nothing to save
-        if not self.output_dir:
-            return False
-
-        base_name = self.image_files[self.current_index].stem
-        h, w = self.current_image.shape[:2]
-
-        # Save PNG mask if enabled
-        if self.export_png_var.get():
-            mask_path = self.output_dir / "masks" / f"{base_name}_{self.instance_count}.png"
-            cv2.imwrite(str(mask_path), self.mask)
-
-        # Save YOLO format if enabled
-        if self.export_yolo_var.get():
-            self._save_yolo_annotation(base_name, h, w)
-
-        # COCO format is handled separately when moving to next image
-        return True
+    def _save_png_masks(self, base_name, h, w):
+        output_masks_dir = self.output_dir / "masks"
+        for i, ann in enumerate(self.annotations):
+            instance_mask = np.zeros((h, w), dtype=np.uint8)
+            class_id = ann['class_id']+1
+            cv2.fillPoly(instance_mask, [np.array(p, dtype=np.int32) for p in ann['polygons']], class_id*10)
+        mask_path = output_masks_dir / f"{base_name}.png"
+        cv2.imwrite(str(mask_path), instance_mask)
 
     def _save_yolo_annotation(self, base_name, h, w):
-        """Saves the current mask in YOLO segmentation format."""
-        # Find, process, and append contours to the main YOLO txt file
-        contours, _ = cv2.findContours(self.mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         yolo_path = self.output_dir / "annotations" / f"{base_name}.txt"
-        
         yolo_strings = []
-        for contour in contours:
-            if cv2.contourArea(contour) < 10: continue
-            
-            # Normalize points and create YOLO string
-            normalized_points = contour.flatten().astype(float)
-            normalized_points[0::2] /= w
-            normalized_points[1::2] /= h
-            points_str = " ".join(map(str, normalized_points))
-            yolo_strings.append(f"0 {points_str}")
+        for ann in self.annotations:
+            class_id = ann['class_id']
+            for poly in ann['polygons']:
+                normalized_points = np.array(poly, dtype=float).flatten()
+                normalized_points[0::2] /= w  # Normalize x
+                normalized_points[1::2] /= h  # Normalize y
+                points_str = " ".join(map(str, normalized_points))
+                yolo_strings.append(f"{class_id} {points_str}")
 
         if yolo_strings:
-            with open(yolo_path, 'a') as f:
+            with open(yolo_path, 'w') as f:
                 f.write("\n".join(yolo_strings) + "\n")
 
-    def _save_coco_annotations(self):
-        """Saves COCO format annotations for the current image."""
-        if not self.export_coco_var.get():
-            return
-
-        base_name = self.image_files[self.current_index].stem
-        h, w = self.current_image.shape[:2]
-
-        # Add image info to COCO dataset
-        image_info = {
-            "id": self.image_id_counter,
-            "width": w,
-            "height": h,
-            "file_name": f"{base_name}.png",
-            "license": 1,
-            "date_captured": datetime.now().isoformat()
-        }
-        self.coco_data["images"].append(image_info)
-
-        # Find all mask files for this image and add annotations
-        mask_dir = self.output_dir / "masks"
-        if mask_dir.exists():
-            for mask_file in mask_dir.glob(f"{base_name}_*.png"):
-                mask_image = cv2.imread(str(mask_file), cv2.IMREAD_GRAYSCALE)
-                if mask_image is not None:
-                    self._add_coco_annotation(mask_image, self.image_id_counter)
-
+    def _add_image_to_coco(self, base_name, h, w):
+        self.coco_data["images"].append({"id": self.image_id_counter, "width": w, "height": h, "file_name": f"{base_name}.png"})
+        for ann in self.annotations:
+            for poly in ann['polygons']:
+                poly_np = np.array(poly, dtype=np.int32)
+                x, y, w_bbox, h_bbox = cv2.boundingRect(poly_np)
+                self.coco_data["annotations"].append({
+                    "id": self.annotation_id_counter, "image_id": self.image_id_counter,
+                    "category_id": ann['class_id'] + 1, "segmentation": [poly_np.flatten().tolist()],
+                    "area": float(cv2.contourArea(poly_np)), "bbox": [x, y, w_bbox, h_bbox], "iscrowd": 0 })
+                self.annotation_id_counter += 1
         self.image_id_counter += 1
 
-        # Save COCO JSON file
-        coco_path = self.output_dir / "annotations" / "annotations.json"
-        with open(coco_path, 'w') as f:
-            json.dump(self.coco_data, f, indent=2)
-
-    def _add_coco_annotation(self, mask, image_id):
-        """Adds a single mask annotation to the COCO dataset."""
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        for contour in contours:
-            if cv2.contourArea(contour) < 10:
-                continue
-
-            # Calculate bounding box
-            x, y, w, h = cv2.boundingRect(contour)
-            
-            # Calculate area
-            area = cv2.contourArea(contour)
-            
-            # Convert contour to segmentation format
-            segmentation = contour.flatten().tolist()
-            
-            annotation = {
-                "id": self.annotation_id_counter,
-                "image_id": image_id,
-                "category_id": 1,
-                "segmentation": [segmentation],
-                "area": area,
-                "bbox": [x, y, w, h],
-                "iscrowd": 0
-            }
-            
-            self.coco_data["annotations"].append(annotation)
-            self.annotation_id_counter += 1
-
-    def _save_bbox_annotation(self):
-        """Saves bounding box data to a YOLO format .txt file."""
-        base_name = self.image_files[self.current_index].stem
-        h, w = self.current_image.shape[:2]
-        yolo_path = self.output_dir / "annotations" / f"{base_name}.txt"
-        
-        yolo_annotations = []
-        for (x1, y1, x2, y2) in self.bboxes:
-            box_w, box_h = x2 - x1, y2 - y1
-            center_x, center_y = x1 + box_w / 2, y1 + box_h / 2
-            norm_cx, norm_cy = center_x / w, center_y / h
-            norm_w, norm_h = box_w / w, box_h / h
-            yolo_annotations.append(f"0 {norm_cx} {norm_cy} {norm_w} {norm_h}")
-        
-        with open(yolo_path, 'w') as f:
-            f.write("\n".join(yolo_annotations))
+    def _finalize_coco(self):
+        if self.coco_data and self.export_coco_var.get() and self.coco_data['annotations']:
+            all_class_ids = {ann['category_id'] - 1 for ann in self.coco_data['annotations']}
+            self.coco_data['categories'] = [{'id': i + 1, 'name': self.class_names.get(i, f"class_{i}"), 'supercategory': 'object'} for i in sorted(list(all_class_ids))]
+            coco_path = self.output_dir / "annotations" / "annotations.json"
+            with open(coco_path, 'w') as f: json.dump(self.coco_data, f, indent=2)
+            print(f"COCO annotations saved to {coco_path}")
 
     def previous_image(self):
-        if self.image_files and self.current_index > 0:
-            self.current_index -= 1
-            self.load_current_image()
-
+        if self.image_files and self.current_index > 0: self.current_index -= 1; self.load_current_image()
     def next_image(self):
-        if self.image_files and self.current_index < len(self.image_files) - 1:
-            self.current_index += 1
-            self.load_current_image()
-        elif self.image_files:
-            messagebox.showinfo("Done", "You have annotated the last image!")
+        if self.image_files and self.current_index < len(self.image_files) - 1: self.current_index += 1; self.load_current_image()
+        elif self.image_files: self._finalize_coco(); messagebox.showinfo("Done", "You have annotated the last image!")
+
+    # -------------------------------------------------------------------------
+    # Annotation Editing Logic
+    # -------------------------------------------------------------------------
+
+    def _get_instance_at_point(self, x, y):
+        """Finds the topmost instance annotation under the given image coordinates."""
+        for i in range(len(self.annotations) - 1, -1, -1):
+            ann = self.annotations[i]
+            for poly in ann['polygons']:
+                if cv2.pointPolygonTest(np.array(poly, dtype=np.int32), (x, y), False) >= 0:
+                    return i
+        return None
+
+    def _select_instance_for_editing(self, event):
+        """Checks for a click on an existing instance and loads it for editing."""
+        if np.any(self.mask) or self.polygon_points: return False # Don't select if there's an active drawing
+
+        canvas_x, canvas_y = self.canvas.canvasx(event.x), self.canvas.canvasy(event.y)
+        img_x, img_y = self._canvas_to_image_coords(canvas_x, canvas_y)
+
+        instance_idx = self._get_instance_at_point(img_x, img_y)
+        if instance_idx is not None:
+            self.editing_instance_index = instance_idx
+            
+            # Remove instance from list and load its data
+            instance_to_edit = self.annotations.pop(instance_idx)
+            class_id = instance_to_edit['class_id']
+            polygons = [np.array(p, dtype=np.int32) for p in instance_to_edit['polygons']]
+
+            # Set the tool to the correct class
+            self.current_class.set(class_id)
+            self._update_class_display()
+            
+            # Load polygons into the active mask
+            self.mask.fill(0)
+            cv2.fillPoly(self.mask, polygons, 255)
+            
+            self.mask_status_var.set(f"Editing instance {instance_idx}. Press 'i' to save changes.")
+            self.update_display()
+            return True # Signifies that an instance was selected
+            
+        return False # No instance was selected
 
     # -------------------------------------------------------------------------
     # Drawing & Annotation Logic
     # -------------------------------------------------------------------------
 
     def _load_sam_model(self, model_name):
-        """Loads the specified SAM model."""
         try:
             self.status_var.set(f"Loading SAM model: {model_name}...")
             self.root.update_idletasks()
@@ -583,146 +485,64 @@ class ImageAnnotationTool:
             device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
             self.sam_model.to(device)
             self.status_var.set(f"SAM model '{model_name}' loaded successfully on {device}.")
-        except Exception as e:
-            messagebox.showerror("Model Error", f"Could not load SAM model: {model_name}\n\n{e}\n\nPlease ensure the model file is in the correct directory.")
-            self.status_var.set(f"Failed to load model: {model_name}")
+        except Exception as e: messagebox.showerror("Model Error", f"Could not load SAM model: {model_name}\n\n{e}"); self.status_var.set(f"Failed to load model: {model_name}")
     
     def _magic_click(self, event):
-        """Performs segmentation using the SAM model based on a user click."""
-        if not self.sam_model:
-            messagebox.showwarning("Warning", "SAM model is not loaded.")
-            return
-
-        canvas_x = self.canvas.canvasx(event.x)
-        canvas_y = self.canvas.canvasy(event.y)
+        if not self.sam_model: return
+        canvas_x, canvas_y = self.canvas.canvasx(event.x), self.canvas.canvasy(event.y)
         img_x, img_y = self._canvas_to_image_coords(canvas_x, canvas_y)
-
         h, w = self.current_image.shape[:2]
         if not (0 <= img_x < w and 0 <= img_y < h): return
 
         self.status_var.set("Running SAM inference...")
         self.root.update_idletasks()
-        
         results = self.sam_model.predict(self.current_image, points=[[img_x, img_y]], labels=[1])
-        
-        if results[0].masks is not None:
+        if results and results[0].masks:
             new_mask = results[0].masks.data[0].cpu().numpy().astype(np.uint8) * 255
-            if self.tool_polarity == "positive":
-                self.mask = cv2.bitwise_or(self.mask, new_mask)
-            else: # Negative
-                self.mask = cv2.bitwise_and(self.mask, cv2.bitwise_not(new_mask))
+            if self.tool_polarity == "positive": self.mask = cv2.bitwise_or(self.mask, new_mask)
+            else: self.mask = cv2.bitwise_and(self.mask, cv2.bitwise_not(new_mask))
             self.update_display()
-            self._update_mask_status()
-        
         self._update_status()
 
     def _polygon_click(self, event):
-
-        # Convert canvas click coordinates to image coordinates
-        canvas_x = self.canvas.canvasx(event.x)
-        canvas_y = self.canvas.canvasy(event.y)
+        canvas_x, canvas_y = self.canvas.canvasx(event.x), self.canvas.canvasy(event.y)
         img_x, img_y = self._canvas_to_image_coords(canvas_x, canvas_y)
-
-        # Ensure the click is within the image bounds
         h, w = self.current_image.shape[:2]
-        if not (0 <= img_x < w and 0 <= img_y < h):
-            return
+        if not (0 <= img_x < w and 0 <= img_y < h): return
 
         clicked_point = (img_x, img_y)
-
-        if len(self.polygon_points)>0:
+        if self.polygon_points:
             distances = [distance.euclidean(clicked_point, p) for p in self.polygon_points]
             min_dist_idx = np.argmin(distances)
-        else:
-            distances=[]
-        # If the closest point is within the threshold, remove it
-        if distances and distances[min_dist_idx] < self.REMOVAL_DISTANCE_THRESHOLD:
-            self.polygon_points.pop(min_dist_idx)
-        else:
-            self.polygon_points.append(list(clicked_point))
-
-        # After modifying the points, update the mask and redraw the display
-        self._update_mask_with_polygon()
-        self.update_display()
-        self._update_mask_status()
-        self._update_status()
+            if distances[min_dist_idx] < self.REMOVAL_DISTANCE_THRESHOLD / self.zoom_level: self.polygon_points.pop(min_dist_idx)
+            else: self.polygon_points.append(list(clicked_point))
+        else: self.polygon_points.append(list(clicked_point))
+        self._update_mask_with_polygon(); self.update_display()
 
     def _update_mask_with_polygon(self):
-        """
-        Generates a new mask from the current list of polygon points.
-        This function ensures that the polygon is drawn fresh on each update,
-        preventing artifacts from repeated bitwise operations.
-        """
-        # Always start from the mask state before the current polygon was drawn.
-        # This makes the polygon drawing a single, editable operation.
-        if self.polygon_mask is not None:
-            temp_mask = self.polygon_mask.copy()
-        else:
-            temp_mask = np.zeros_like(self.polygon_mask)
-
-        # A polygon requires at least 3 vertices to form a shape.
+        self.polygon_mask.fill(0)
         if len(self.polygon_points) >= 3:
-            # Create a blank mask to draw the polygon onto.
-            poly_mask_layer = np.zeros_like(temp_mask)
-
-            # Format points for OpenCV's fillPoly function.
             pts = np.array(self.polygon_points, dtype=np.int32)
-
             centroid = np.mean(pts, axis=0)
             angles = np.arctan2(pts[:, 1] - centroid[1], pts[:, 0] - centroid[0])
             pts = pts[np.argsort(angles)]
-            cv2.fillPoly(poly_mask_layer, [pts], 255)
-
-            # Combine the new polygon with the original mask.
-            # This assumes the polygon is always additive. For subtractive
-            # polygons, you would need another UI toggle and use bitwise_and/not.
-            # self.polygon_mask = cv2.bitwise_or(temp_mask, poly_mask_layer)
-            self.polygon_mask = poly_mask_layer
-        else:
-            # If there are not enough points for a shape, just show the original mask.
-            self.polygon_mask = temp_mask
+            cv2.fillPoly(self.polygon_mask, [pts], 255)
+            # cv2.fillPoly(self.polygon_mask, [np.array(self.polygon_points, dtype=np.int32)], 255)
 
     def _merge_polygon_into_mask(self):
-        if self.polygon_mask is not None and np.sum(self.polygon_mask)>0:
-            if self.tool_polarity == "positive":
-                self.mask = cv2.bitwise_or(self.mask, self.polygon_mask)
-            else:
-                self.mask = cv2.bitwise_and(self.mask, cv2.bitwise_not(self.polygon_mask))
+        if np.sum(self.polygon_mask) > 0:
+            if self.tool_polarity == "positive": self.mask = cv2.bitwise_or(self.mask, self.polygon_mask)
+            else: self.mask = cv2.bitwise_and(self.mask, cv2.bitwise_not(self.polygon_mask))
+            self.polygon_mask.fill(0); self.polygon_points = []; self.update_display()
 
-            self.polygon_mask = np.zeros(self.current_image.shape[:2], dtype=np.uint8)
-            self.polygon_points = []
-            self.update_display()
-
-    # --- Mask Drawing ---
-    def _start_mask_drawing(self, event):
-        self.drawing = True
-        # --- FIX: Use canvas coordinates ---
-        self.last_x = self.canvas.canvasx(event.x)
-        self.last_y = self.canvas.canvasy(event.y)
-        # --- End of FIX ---
-        self.drawn_segments = []
-        
+    def _start_mask_drawing(self, event): self.drawing = True; self.last_x, self.last_y = self.canvas.canvasx(event.x), self.canvas.canvasy(event.y); self.drawn_segments = []
     def _draw_mask(self, event):
         if not self.drawing: return
-
-        # --- FIX: Get current canvas coordinates ---
-        current_x = self.canvas.canvasx(event.x)
-        current_y = self.canvas.canvasy(event.y)
-        # --- End of FIX ---
-
-        fill_color = "green" if self.tool_polarity == "positive" else "red"
-        # --- FIX: Use canvas coordinates for drawing ---
-        self.canvas.create_line(self.last_x, self.last_y, current_x, current_y, 
-                                fill=fill_color, width=self.brush_size, capstyle=tk.ROUND, 
-                                smooth=True, tags="drawing_line")
-        self.drawn_segments.append((self.last_x, self.last_y, current_x, current_y))
-        self.last_x, self.last_y = current_x, current_y
-        # --- End of FIX ---
+        current_x, current_y = self.canvas.canvasx(event.x), self.canvas.canvasy(event.y)
+        self.canvas.create_line(self.last_x, self.last_y, current_x, current_y, fill="green" if self.tool_polarity == "positive" else "red", width=self.brush_size, capstyle=tk.ROUND, smooth=True, tags="drawing_line")
+        self.drawn_segments.append((self.last_x, self.last_y, current_x, current_y)); self.last_x, self.last_y = current_x, current_y
         
     def _stop_mask_drawing(self, event):
-        # This method is already correct because it processes self.drawn_segments,
-        # which will now be populated with the correct canvas coordinates from _draw_mask.
-        # No changes needed here.
         if not self.drawing: return
         self.drawing = False
         if self.drawn_segments:
@@ -731,236 +551,157 @@ class ImageAnnotationTool:
             for x1, y1, x2, y2 in self.drawn_segments:
                 last_img_x, last_img_y = self._canvas_to_image_coords(x1, y1)
                 img_x, img_y = self._canvas_to_image_coords(x2, y2)
-                cv2.line(self.mask, (last_img_x, last_img_y), (img_x, img_y), 
-                         mask_value, draw_brush_size)
-        self.canvas.delete("drawing_line")
-        self.update_display()
-        self._update_mask_status()
-
-    # --- Bbox Drawing ---
-    def _start_bbox_drawing(self, event):
-        self.drawing = True
-        # --- FIX: Use canvas coordinates ---
-        canvas_x = self.canvas.canvasx(event.x)
-        canvas_y = self.canvas.canvasy(event.y)
-        self.bbox_start_coords = (canvas_x, canvas_y)
-        # --- End of FIX ---
-        self.current_bbox_rect = self.canvas.create_rectangle(
-            *self.bbox_start_coords, *self.bbox_start_coords, 
-            outline="red", width=2, tags="bbox_rect")
-
-    def _draw_bbox(self, event):
-        if not self.drawing: return
-        # --- FIX: Use canvas coordinates ---
-        current_x = self.canvas.canvasx(event.x)
-        current_y = self.canvas.canvasy(event.y)
-        self.canvas.coords(self.current_bbox_rect, *self.bbox_start_coords, current_x, current_y)
-        # --- End of FIX ---
-        
-    def _stop_bbox_drawing(self, event):
-        # This method is also already correct because it reads final coordinates
-        # from the canvas object itself, which are already in canvas space.
-        # No changes needed here.
-        if not self.drawing: return
-        self.drawing = False
-        x1, y1, x2, y2 = self.canvas.coords(self.current_bbox_rect)
-        self.canvas.delete(self.current_bbox_rect)
-        self.current_bbox_rect = None
-
-        img_x1, img_y1 = self._canvas_to_image_coords(x1, y1)
-        img_x2, img_y2 = self._canvas_to_image_coords(x2, y2)
-        
-        final_x1, final_y1 = min(img_x1, img_x2), min(img_y1, img_y2)
-        final_x2, final_y2 = max(img_x1, img_x2), max(img_y1, img_y2)
-
-        if final_x2 - final_x1 > 1 and final_y2 - final_y1 > 1:
-            self.bboxes.append((final_x1, final_y1, final_x2, final_y2))
-        
-        self.update_display()
+                cv2.line(self.mask, (last_img_x, last_img_y), (img_x, img_y), mask_value, draw_brush_size)
+        self.canvas.delete("drawing_line"); self.update_display()
 
     # -------------------------------------------------------------------------
     # Canvas View Controls (Zoom, Pan, Display)
     # -------------------------------------------------------------------------
     def update_display(self):
-        """Redraws the canvas with the current image, mask, and annotations."""
         if self.current_image is None: return
-
         h, w = self.current_image.shape[:2]
-        display_w = int(w * self.zoom_level)
-        display_h = int(h * self.zoom_level)
-
-        if self.annotation_mode == 'mask' and self.mask is not None and np.sum(self.mask) > 0:
-            colored_mask = np.zeros_like(self.current_image)
-            colored_mask[self.mask > 0] = [0, 255, 0] # Green overlay
-            blended = cv2.addWeighted(self.current_image, 0.7, colored_mask, 0.3, 0)
-            display_image_data = blended
-        else:
-            display_image_data = self.current_image
-
-        if self.annotation_mode == 'mask' and self.polygon_mask is not None and np.sum(self.polygon_mask) > 0:
-            colored_mask = np.zeros_like(self.current_image)
-            colored_mask[self.polygon_mask > 0] = [0, 255, 255]
-            blended = cv2.addWeighted(display_image_data, 0.7, colored_mask, 0.3, 0)
-            display_image_data = blended
-
-        if len(self.polygon_points)!=0:
-            colored_mask = np.zeros_like(self.current_image)
-            for point in self.polygon_points:
-                cv2.drawMarker(
-                    img=colored_mask,
-                    position=point,
-                    color=(255, 255, 0),
-                    markerType=cv2.MARKER_DIAMOND,
-                    markerSize=2,
-                    thickness=1
-                )
-            blended = cv2.addWeighted(display_image_data, 0.7, colored_mask, 0.3, 0)
-            display_image_data = blended
-
-        resized_image = cv2.resize(display_image_data, (display_w, display_h), interpolation=cv2.INTER_NEAREST)
-        pil_image = Image.fromarray(resized_image)
-        self.current_photo = ImageTk.PhotoImage(pil_image)
+        display_w, display_h = int(w * self.zoom_level), int(h * self.zoom_level)
+        display_image_data = self.current_image.copy()
         
+        overlay = np.zeros_like(display_image_data, dtype=np.uint8)
+        for ann in self.annotations:
+            color_rgb = self.CLASS_COLORS[ann['class_id'] % len(self.CLASS_COLORS)]
+            polygons_for_cv2 = [np.array(p, dtype=np.int32) for p in ann['polygons']]
+            cv2.fillPoly(overlay, polygons_for_cv2, color_rgb)
+        
+        display_image_data = cv2.addWeighted(display_image_data, 0.6, overlay, 0.4, 0)
+
+        # Draw active mask (brush/SAM/editing) on top
+        if np.any(self.mask):
+            active_mask_overlay = np.zeros_like(self.current_image)
+            color = (128, 128, 128)
+            active_mask_overlay[self.mask > 0] = color
+            display_image_data = cv2.addWeighted(display_image_data, 0.7, active_mask_overlay, 0.3, 0)
+
+        # Draw active polygon on top
+        if np.any(self.polygon_mask):
+            active_poly_overlay = np.zeros_like(self.current_image)
+            active_poly_overlay[self.polygon_mask > 0] = (255, 255, 0) # Yellow
+            display_image_data = cv2.addWeighted(display_image_data, 0.7, active_poly_overlay, 0.3, 0)
+        
+        if len(self.polygon_points) > 0:
+            for point in self.polygon_points: cv2.circle(display_image_data, tuple(map(int, point)), radius=3, color=(255, 255, 0), thickness=-1)
+            if len(self.polygon_points) > 1: cv2.polylines(display_image_data, [np.array(self.polygon_points, dtype=np.int32)], isClosed=False, color=(255, 255, 0), thickness=1)
+
+        pil_image = Image.fromarray(cv2.resize(display_image_data, (display_w, display_h), interpolation=cv2.INTER_NEAREST))
+        self.current_photo = ImageTk.PhotoImage(pil_image)
         self.canvas.delete("all")
         self.canvas.create_image(self.offset_x, self.offset_y, anchor=tk.NW, image=self.current_photo)
-        
-        if self.annotation_mode == 'bbox':
-            for x1, y1, x2, y2 in self.bboxes:
-                c_x1, c_y1 = self._image_to_canvas_coords(x1, y1)
-                c_x2, c_y2 = self._image_to_canvas_coords(x2, y2)
-                self.canvas.create_rectangle(c_x1, c_y1, c_x2, c_y2, outline="cyan", width=2)
-        
         self.canvas.configure(scrollregion=(self.offset_x, self.offset_y, self.offset_x + display_w, self.offset_y + display_h))
-        self._update_status()
+        self._update_status(); self._update_mask_status()
 
     def fit_to_window(self):
         if self.current_image is None: return
         canvas_w, canvas_h = self.canvas.winfo_width(), self.canvas.winfo_height()
-        if canvas_w <= 1 or canvas_h <=1: canvas_w, canvas_h = 800, 600 # Default if not drawn yet
-
+        if canvas_w <= 1 or canvas_h <=1: canvas_w, canvas_h = 1000, 700
         h, w = self.current_image.shape[:2]
-        scale = min(canvas_w / w, canvas_h / h)
-        self.zoom_level = scale
-        self.offset_x, self.offset_y = 0, 0
-        self.update_display()
+        self.zoom_level = min(canvas_w / w, canvas_h / h)
+        self.offset_x, self.offset_y = 0, 0; self.update_display()
 
     def _zoom_in(self): self._zoom(delta=120)
     def _zoom_out(self): self._zoom(delta=-120)
-
     def _zoom(self, event=None, delta=None):
         if self.current_image is None: return
         if delta is None: delta = event.delta
-
         mouse_x = self.canvas.canvasx(event.x) if event else self.canvas.winfo_width() / 2
         mouse_y = self.canvas.canvasy(event.y) if event else self.canvas.winfo_height() / 2
-        
-        zoom_factor = 1.1 if delta > 0 else 0.9
-        old_zoom = self.zoom_level
-        self.zoom_level = max(0.1, min(5.0, self.zoom_level * zoom_factor))
-
+        zoom_factor = 1.1 if delta > 0 else 0.9; old_zoom = self.zoom_level
+        self.zoom_level = max(0.1, min(10.0, self.zoom_level * zoom_factor))
         if old_zoom != self.zoom_level:
             zoom_ratio = self.zoom_level / old_zoom
             self.offset_x = mouse_x - (mouse_x - self.offset_x) * zoom_ratio
             self.offset_y = mouse_y - (mouse_y - self.offset_y) * zoom_ratio
             self.update_display()
 
-    def _start_panning(self, event):
-        self.panning, self.pan_start_x, self.pan_start_y = True, event.x, event.y
-        
+    def _start_panning(self, event): self.panning, self.pan_start_x, self.pan_start_y = True, event.x, event.y
     def _pan(self, event):
         if not self.panning: return
         dx, dy = event.x - self.pan_start_x, event.y - self.pan_start_y
-        self.offset_x += dx
-        self.offset_y += dy
-        self.pan_start_x, self.pan_start_y = event.x, event.y
-        self.update_display()
-
+        self.offset_x += dx; self.offset_y += dy
+        self.pan_start_x, self.pan_start_y = event.x, event.y; self.update_display()
     def _stop_panning(self, event): self.panning = False
 
     # -------------------------------------------------------------------------
     # Utility & Helper Methods
     # -------------------------------------------------------------------------
     def clear_mask(self):
-        if self.mask is not None:
-            self.mask.fill(0)
-            self.update_display()
-            self._update_mask_status()
-
-    def clear_bboxes(self):
-        self.bboxes = []
+        if self.mask is not None: self.mask.fill(0)
+        self.polygon_points = []; self.editing_instance_index = None
+        if self.polygon_mask is not None: self.polygon_mask.fill(0)
         self.update_display()
+
+    def clear_all_annotations(self):
+        if messagebox.askokcancel("Confirm", "Are you sure you want to delete all annotations for this image?"):
+            self.annotations = []; self.clear_mask()
 
     def _update_status(self):
         if self.image_files:
             filename = self.image_files[self.current_index].name
-            zoom_percent = int(self.zoom_level * 100)
-            export_formats = []
-            if self.export_png_var.get(): export_formats.append("PNG")
-            if self.export_yolo_var.get(): export_formats.append("YOLO")
-            if self.export_coco_var.get(): export_formats.append("COCO")
-            formats_str = "+".join(export_formats)
-            self.status_var.set(f"Image {self.current_index + 1}/{len(self.image_files)}: {filename} (Zoom: {zoom_percent}%) Export: {formats_str}")
+            self.status_var.set(f"Image {self.current_index + 1}/{len(self.image_files)}: {filename} (Zoom: {int(self.zoom_level*100)}%)")
 
     def _update_mask_status(self):
-        if self.mask is not None and np.any(self.mask):
-            annotated_pixels = np.sum(self.mask > 0)
-            percentage = (annotated_pixels / self.mask.size) * 100
-            self.mask_status_var.set(f"Mask active ({percentage:.2f}% annotated). Instance: {self.instance_count}")
+        if self.editing_instance_index is not None:
+            self.mask_status_var.set(f"Editing instance {self.editing_instance_index}. Press 'i' to save changes.")
+        elif np.any(self.mask) or self.polygon_points:
+            self.mask_status_var.set(f"Instances: {len(self.annotations)} (Active drawing)")
         else:
-            self.mask_status_var.set(f"No active mask. Ready for instance: {self.instance_count}")
+            self.mask_status_var.set(f"Instances saved: {len(self.annotations)}")
 
-    def _canvas_to_image_coords(self, canvas_x, canvas_y):
-        return int((canvas_x - self.offset_x) / self.zoom_level), int((canvas_y - self.offset_y) / self.zoom_level)
-    
-    def _image_to_canvas_coords(self, img_x, img_y):
-        return img_x * self.zoom_level + self.offset_x, img_y * self.zoom_level + self.offset_y
+    def _canvas_to_image_coords(self, canvas_x, canvas_y): return int((canvas_x - self.offset_x) / self.zoom_level), int((canvas_y - self.offset_y) / self.zoom_level)
     
     def _load_mask_from_file(self):
-        """Command for the 'Load Mask' button. Tries to load a mask and gives user feedback."""
-        if not self.mask_dir:
-            messagebox.showwarning("Warning", "Please select a mask directory first.")
-            return
-
-        if self._try_load_existing_mask():
-            messagebox.showinfo("Success", "Mask loaded successfully.")
-            self.update_display()
-            self._update_mask_status()
-        else:
-            image_name = self.image_files[self.current_index].name
-            messagebox.showerror("Error", f"Could not find a mask for '{image_name}' in '{self.mask_dir}'.")
+        if not self.mask_dir: messagebox.showwarning("Warning", "Please select a mask directory first."); return
+        if self._try_load_existing_mask(): messagebox.showinfo("Success", "Mask loaded."); self._save_instance()
+        else: messagebox.showerror("Error", f"Could not find a mask for '{self.image_files[self.current_index].name}' in '{self.mask_dir}'.")
 
     def _try_load_existing_mask(self):
-        """Attempts to find and load a mask corresponding to the current image."""
         if not self.mask_dir or not self.image_files: return False
-
         image_path = self.image_files[self.current_index]
-        possible_mask_names = [f"predicted_{image_path.stem}.png", f"{image_path.stem}.png"]
-        mask_path = None
-        for name in possible_mask_names:
-            path_to_check = self.mask_dir / name
-            if path_to_check.exists():
-                mask_path = path_to_check
-                break
-        
+        mask_path = next((p for p in [self.mask_dir / f"{image_path.stem}.png", self.mask_dir / f"predicted_{image_path.stem}.png"] if p.exists()), None)
         if not mask_path: return False
-
         try:
             loaded_mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
             if loaded_mask is None: return False
-
             h, w = self.current_image.shape[:2]
-            if loaded_mask.shape != (h, w):
-                loaded_mask = cv2.resize(loaded_mask, (w, h), interpolation=cv2.INTER_NEAREST)
-
+            if loaded_mask.shape != (h, w): loaded_mask = cv2.resize(loaded_mask, (w, h), interpolation=cv2.INTER_NEAREST)
             _, self.mask = cv2.threshold(loaded_mask, 1, 255, cv2.THRESH_BINARY)
             return True
-        except Exception as e:
-            print(f"Error loading mask {mask_path}: {e}")
-            return False
+        except Exception as e: print(f"Error loading mask {mask_path}: {e}"); return False
+
+    def _try_run_yolo_model(self):
+        if not self.yolo_model: return
+        results = self.yolo_model.predict(self.current_image, conf=0.5)
+        if not results or results[0].masks is None: return
+        h, w = self.current_image.shape[:2]
+        masks, classes = results[0].masks.data.cpu().numpy(), results[0].boxes.cls.cpu().numpy()
+        for i, mask in enumerate(masks):
+            mask_resized = cv2.resize(mask, (w, h), interpolation=cv2.INTER_NEAREST).astype(np.uint8)
+            contours, _ = cv2.findContours(mask_resized, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if not contours: continue
+            simplified_polygons = []
+            for c in contours:
+                if cv2.contourArea(c) < 10: continue
+                simplified_contour = cv2.approxPolyDP(c, 0.005 * cv2.arcLength(c, True), True)
+                if len(simplified_contour) >= 3: simplified_polygons.append(simplified_contour.squeeze(axis=1).tolist())
+            if simplified_polygons: self.annotations.append({"class_id": int(classes[i]), "polygons": simplified_polygons})
+        self.update_display()
+
+    def _initialize_coco_dataset(self):
+        self.coco_data = {"info": {}, "licenses": [], "images": [], "annotations": [], "categories": []}
+        self.image_id_counter = 1; self.annotation_id_counter = 1
 
 def main():
     root = tk.Tk()
     app = ImageAnnotationTool(root)
+    def on_closing():
+        if messagebox.askokcancel("Quit", "Do you want to quit? This will finalize the COCO annotation file if enabled."):
+            app._finalize_coco(); root.destroy()
+    root.protocol("WM_DELETE_WINDOW", on_closing)
     root.mainloop()
 
 if __name__ == "__main__":
